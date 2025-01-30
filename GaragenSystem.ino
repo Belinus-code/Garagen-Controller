@@ -4,10 +4,12 @@
 #include <Preferences.h>
 #include <time.h>
 #include <Time.h>
-#include <ESPAsyncWebServer.h>
+#include <WebServer.h>
 #include <RTClib.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <nvs.h>
+#include <nvs_flash.h>
 
 #include "website.h"
 #include "secrets.h"
@@ -77,12 +79,13 @@ int SETTING_CLOSE_MINUTE = 0;
 // ----- Programm-Logik -----
 
 int zustand = UNBEKANNTER_ZUSTAND;
-int maxLogs = 100;
+int maxLogs = 50;
 volatile unsigned long lastInterruptTimeFalling = 0;               // Timer zum entprellen des Trigger-Signals
 volatile unsigned long lastInterruptTimeRising = 0;
 volatile unsigned long startMovingTime = 0;                 // letzte Zustandsänderung zu SCHLIEST oder OEFFNET (Timer)
 volatile unsigned long openSinceTime = 0;                   // Zeitstempel seit dem das Tor offen ist
-WiFiServer server(80);                                      // TCP-Server auf Port 80
+WiFiServer server(80);                                      // TCP-Server auf Port 80 für einfachen TCP-Toggle
+WebServer httpServer(81);                                  // Webserver für erweiterte Einstellungsmöglichkeiten auf Port 81
 Preferences preferences;
 const char* ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 3600;                            // Offset in Sekunden für Zeitzone (z. B. MEZ: +1 Stunde)
@@ -242,9 +245,23 @@ void setup() {
 
   // ----- Einstellungen aus EEPROM laden/speichern -----
 
+  //prüfen ob Speicher voll ist, falls ja Speicher leeren um Fehler zu vermeiden.
+  nvs_stats_t nvs_stats;
+  esp_err_t err = nvs_get_stats(NULL, &nvs_stats);
+  
+  if(nvs_stats.free_entries < 10)
+  {
+    Serial.print("Nur noch ");
+    Serial.print(nvs_stats.free_entries);
+    Serial.println(" Eintraege frei, speicher wurde geloescht");
+    nvs_flash_erase();
+    nvs_flash_init(); 
+  }
+  else Serial.println("Keine Speicherprobleme festgestellt");
+
   preferences.begin("GaragenESP", false);
 
-  if(preferences.getInt("S10",-1) >= 0)
+  if(preferences.isKey("S1"))
   {
     Serial.println("Einstellungen gefunden. Werden geladen.");
     SETTING_STOP_STUCK = preferences.getBool("S1");
@@ -277,204 +294,6 @@ void setup() {
   readKontaktAuf = (!SETTING_KONTAKT_CONFIG)? defaultReadKontaktAuf:defaultReadKontaktZu;
   readKontaktZu = (!SETTING_KONTAKT_CONFIG)? defaultReadKontaktZu:defaultReadKontaktAuf;
 
-  AsyncWebServer httpServer(81);
-  httpServer.on("/login", HTTP_GET, [](AsyncWebServerRequest *request)
-  {
-    String html = R"rawliteral(
-      <html>
-      <head><title>Login</title></head>
-      <body>
-          <h1>Bitte einloggen</h1>
-          <form action="/login" method="POST">
-              <label>Benutzername:</label><br>
-              <input type="text" name="username"><br>
-              <label>Passwort:</label><br>
-              <input type="password" name="password"><br><br>
-              <input type="submit" value="Login">
-          </form>
-      </body>
-      </html>
-    )rawliteral";
-    request->send(200, "text/html", html);
-  });
-
-  httpServer.on("/login", HTTP_POST, [](AsyncWebServerRequest *request)
-  {
-    if (request->hasParam("username", true) && request->hasParam("password", true))
-    {
-      String Susername = request->getParam("username", true)->value();
-      String Spassword = request->getParam("password", true)->value();
-      // Beispiel: Benutzername und Passwort prüfen
-      if (Susername == username && (Spassword == passwordLogin || Spassword == passwordAdmin))
-      {
-        // Erfolgreich eingeloggt
-        request->redirect("/");
-        isAuthenticated = true;
-        if(Spassword == passwordAdmin) isAdmin=true;
-        lastLoginTime = millis(); // Login-Zeitpunkt speichern
-        return;
-      }
-    }
-    request->send(403, "text/html", "Login fehlgeschlagen! <a href='/login'>Zur&uuml;ck</a>");
-});
-
-  //Setup für den Webserver:
-  httpServer.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
-  {
-    if (!isAuthenticated)
-    {
-      request->redirect("/login"); // Weiterleitung zur Login-Seite
-      return;
-    }
-    if(!isAdmin)request->send_P(200, "text/html", htmlPage, processor);
-    else request->send_P(200, "text/html", htmlAdminPage, processor);
-  });
-
-  httpServer.on("/setState", HTTP_POST, [](AsyncWebServerRequest *request)
-  {
-    zustand = request->getParam("newState", true)->value().toInt();
-    request->redirect("/");
-  });
-
-  httpServer.on("/toggle", HTTP_POST, [](AsyncWebServerRequest *request)
-  {
-    toggle(11);
-    request->redirect("/");
-  });
-
-  httpServer.on("/open", HTTP_POST, [](AsyncWebServerRequest *request)
-  {
-    if(zustand==GESCHLOSSEN || zustand == HALT_ZU || zustand == UNBEKANNTER_ZUSTAND) toggle(11);
-    //openSinceTime=millis(); //resetet den Timer zur Automatischen Torschließung.
-    request->redirect("/");
-  });
-
-  httpServer.on("/close", HTTP_POST, [](AsyncWebServerRequest *request)
-  {
-    if(zustand==GEOEFFNET || zustand == HALT_AUF || zustand == UNBEKANNTER_ZUSTAND) toggle(11);
-    request->redirect("/");
-  });
-
-  
-  httpServer.on("/openTime", HTTP_POST, [](AsyncWebServerRequest *request)
-  {
-    if(zustand==GESCHLOSSEN || zustand == HALT_ZU || zustand == UNBEKANNTER_ZUSTAND)
-    {
-      openSinceTime=millis(); //resetet den Timer zur Automatischen Torschließung.
-      unsigned long temp = request->getParam("openTime", true)->value().toInt()*1000*60;
-      toggle(11, temp);
-    } 
-    
-    request->redirect("/");
-  });
-  
-
-  httpServer.on("/settings", HTTP_POST, [](AsyncWebServerRequest *request)
-  {
-    if (request->hasParam("autoStop", true))
-    {
-      if(SETTING_STOP_STUCK != true)logNachricht(4);
-      SETTING_STOP_STUCK = true;
-    }
-    else SETTING_STOP_STUCK = false;
-    
-    if (request->hasParam("maxOpenTime", true))
-    {
-      if(request->getParam("maxOpenTime", true)->value().toInt()*1000 != SETTING_MAX_OPEN_TIME)logNachricht(5);
-      SETTING_MAX_OPEN_TIME = request->getParam("maxOpenTime", true)->value().toInt()*1000;
-    }
-    if (request->hasParam("maxCloseTime", true))
-    {
-      if(request->getParam("maxCloseTime", true)->value().toInt()*1000 != SETTING_MAX_CLOSE_TIME)logNachricht(6);
-      SETTING_MAX_CLOSE_TIME = request->getParam("maxCloseTime", true)->value().toInt()*1000;
-    }
-    if (request->hasParam("autoClose", true))
-    {
-      if(SETTING_AUTOMATIC_CLOSE != true)logNachricht(7);
-      SETTING_AUTOMATIC_CLOSE = true;
-    }
-    else SETTING_AUTOMATIC_CLOSE = false;
-    
-    if (request->hasParam("autoCloseDelay", true))
-    {
-      if(request->getParam("autoCloseDelay", true)->value().toInt()*1000*60 != SETTING_AUTOMATIC_CLOSE_TIME)logNachricht(8);
-      SETTING_AUTOMATIC_CLOSE_TIME = request->getParam("autoCloseDelay", true)->value().toInt()*1000*60;
-    }
-    if (request->hasParam("warningDelay", true))
-    {
-      if(request->getParam("warningDelay", true)->value().toInt()*1000 != SETTING_AUTOMATIC_CLOSE_WARNING_TIME)logNachricht(9);
-      SETTING_AUTOMATIC_CLOSE_WARNING_TIME = request->getParam("warningDelay", true)->value().toInt()*1000;
-    }
-    if (request->hasParam("AutoCloseEnabled", true))
-    {
-      if(SETTING_CLOSE_ON_TIME != true)logNachricht(16);
-      SETTING_CLOSE_ON_TIME = true;
-    }
-    else SETTING_CLOSE_ON_TIME = false;
-
-    preferences.begin("GaragenESP", false);
-    preferences.putBool("S1", SETTING_STOP_STUCK);
-    preferences.putBool("S2", SETTING_AUTOMATIC_CLOSE);
-    preferences.putInt("S3", SETTING_MAX_OPEN_TIME);
-    preferences.putInt("S4", SETTING_MAX_CLOSE_TIME);
-    preferences.putInt("S5", SETTING_AUTOMATIC_CLOSE_TIME);
-    preferences.putInt("S6", SETTING_AUTOMATIC_CLOSE_WARNING_TIME);
-    preferences.putBool("S8", SETTING_CLOSE_ON_TIME);
-    preferences.end();
-
-    request->redirect("/");
-  });
-  
-  httpServer.on("/set_auto_close_time", HTTP_POST, [](AsyncWebServerRequest *request) {
-  if (request->hasParam("time", true)) {
-    String timeString = request->getParam("time", true)->value(); // Format: hh:mm
-    int separatorIndex = timeString.indexOf(':');
-    if (separatorIndex != -1) {
-      SETTING_CLOSE_HOUR = timeString.substring(0, separatorIndex).toInt(); // Stunden extrahieren
-      SETTING_CLOSE_MINUTE = timeString.substring(separatorIndex + 1).toInt(); // Minuten extrahieren
-
-      Serial.println(SETTING_CLOSE_HOUR);
-      Serial.println(SETTING_CLOSE_MINUTE);
-      
-      // Uhrzeit speichern (z. B. in Preferences)
-      preferences.begin("GaragenESP", false);
-      preferences.putInt("S9", SETTING_CLOSE_HOUR);
-      preferences.putInt("S10", SETTING_CLOSE_MINUTE);
-      preferences.end();
-      logNachricht(17);
-      logNachricht(18);
-    }
-  }
-
-  request->redirect("/");
-  });
-
-
-  httpServer.on("/read_config", HTTP_POST, [](AsyncWebServerRequest *request)
-  {
-    if (request->hasParam("zuContact", true)) {
-      String selectedPin = request->getParam("zuContact", true)->value();
-      if (selectedPin == "1")
-      {
-        SETTING_KONTAKT_CONFIG = true;
-      }
-      else if (selectedPin == "2")
-      {
-        SETTING_KONTAKT_CONFIG = false;
-      }
-      preferences.begin("GaragenESP", false);
-      preferences.putBool("S7", SETTING_KONTAKT_CONFIG);
-      preferences.end();
-
-      readKontaktAuf = (!SETTING_KONTAKT_CONFIG)? defaultReadKontaktAuf:defaultReadKontaktZu;
-      readKontaktZu = (!SETTING_KONTAKT_CONFIG)? defaultReadKontaktZu:defaultReadKontaktAuf;
-      request->redirect("/");
-    }
-    else
-    {
-      request->redirect("/");
-    }
-  });
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi nicht verbunden, warte...");
     while (WiFi.status() != WL_CONNECTED) {
@@ -485,6 +304,18 @@ void setup() {
   }
   Serial.print("Freier Heap vor httpServer.begin(): ");
   Serial.println(ESP.getFreeHeap());
+
+  httpServer.on("/login", HTTP_GET, handleLoginPage);
+  httpServer.on("/login", HTTP_POST, handleLogin);
+  httpServer.on("/", HTTP_GET, handleRoot);
+  httpServer.on("/setState", HTTP_POST, handleSetState);
+  httpServer.on("/toggle", HTTP_POST, handleHttpToggle);
+  httpServer.on("/open", HTTP_POST, handleOpen);
+  httpServer.on("/close", HTTP_POST, handleClose);
+  httpServer.on("/openTime", HTTP_POST, handleOpenTime);
+  httpServer.on("/set_auto_close_time", HTTP_POST, handleSetAutoCloseTime);
+  httpServer.on("/settings", HTTP_POST, handleSettings);
+  httpServer.on("/read_config", HTTP_POST, handleReadConfig);
   httpServer.begin();
 
   setupTime();
@@ -495,6 +326,7 @@ void loop() {
   ArduinoOTA.handle();                        // OverTheAir Updates
   handleToggle(checkForToggle());             // TCP-Toggle
   zustandsMonitoring();
+  httpServer.handleClient();
 
   if (millis() - lastSync > syncInterval)     //Einmal Stündlich:
   {
@@ -668,12 +500,14 @@ void handleTrigger() {
     {
       case GEOEFFNET:
         zustand = SCHLIEST;
+        defaultZuIntState = false;
         startMovingTime = millis();
         digitalWrite(piezoPin,LOW);
         break;
       
       case GESCHLOSSEN:
         zustand = OEFFNET;
+        defaultAufIntState = false;
         startMovingTime = millis();
         break;
 
@@ -687,6 +521,7 @@ void handleTrigger() {
       
       case HALT_ZU:
         zustand = OEFFNET;
+        defaultAufIntState = false;
         startMovingTime = millis();
         break;
 
@@ -696,8 +531,10 @@ void handleTrigger() {
 
       case STECKT_FEST_AUF:
         zustand = HALT_AUF;
+        break;
 
       case HALT_AUF:
+        defaultZuIntState = false;
         zustand = SCHLIEST;
         startMovingTime = millis();
         break;
@@ -852,39 +689,225 @@ unsigned long getUnixTimestamp() {
     return (unsigned long)now; // UNIX-Timestamp zurückgeben
 }
 
-bool authenticate(AsyncWebServerRequest *request) {
-    if (!request->hasParam("username", true) || !request->hasParam("password", true)) {
-        return false;
-    }
-    String user = request->getParam("username", true)->value();
-    String pass = request->getParam("password", true)->value();
-    return (user == username && pass == passwordLogin);
+
+String preprocessor(String page)
+{
+  page.replace("{STATE}", zustandstext[zustand]);
+  page.replace("{AUTO_STOP}", (SETTING_STOP_STUCK ? "checked" : ""));
+  page.replace("{MAX_OPEN_TIME}", String(SETTING_MAX_OPEN_TIME/1000));
+  page.replace("{MAX_CLOSE_TIME}", String(SETTING_MAX_CLOSE_TIME/1000));
+  page.replace("{AUTO_CLOSE}", (SETTING_AUTOMATIC_CLOSE ? "checked" : ""));
+  page.replace("{AUTO_CLOSE_DELAY}", String(SETTING_AUTOMATIC_CLOSE_TIME/60000));
+  page.replace("{WARNING_DELAY}", String(SETTING_AUTOMATIC_CLOSE_WARNING_TIME/1000));
+  page.replace("{LOGS}", readLog());
+  page.replace("{RELAY_STATE}", (digitalRead(relayPin)? "HIGH": "LOW"));
+  page.replace("{READ_AUF_STATE}", (digitalRead(readKontaktAuf)? "HIGH": "LOW"));
+  page.replace("{READ_ZU_STATE}", (digitalRead(readKontaktZu)? "HIGH": "LOW"));
+  page.replace("{PIEZO_STATE}", (digitalRead(piezoPin)? "HIGH": "LOW"));
+  page.replace("{TRIGGER_STATE}", (digitalRead(triggerPin)? "HIGH": "LOW"));
+  page.replace("{PIN1}", (SETTING_KONTAKT_CONFIG? "checked": ""));
+  page.replace("{PIN2}", (SETTING_KONTAKT_CONFIG? "": "checked"));
+  page.replace("{AKTUELLER_ZUSTAND}", String(zustand));
+  page.replace("{AUTO_CLOSE_CLOCK}", (SETTING_CLOSE_ON_TIME ? "checked" : ""));
+  char timeBuffer[6];
+  snprintf(timeBuffer, sizeof(timeBuffer), "%02d:%02d", SETTING_CLOSE_HOUR, SETTING_CLOSE_MINUTE);
+  page.replace("{CURRENT_TIME}", String(timeBuffer));
+  return page;
 }
 
-String processor(const String& var) {
-    if (var == "STATE") return zustandstext[zustand];
-    if (var == "AUTO_STOP") return SETTING_STOP_STUCK ? "checked" : "";
-    if (var == "MAX_OPEN_TIME") return String(SETTING_MAX_OPEN_TIME/1000);
-    if (var == "MAX_CLOSE_TIME") return String(SETTING_MAX_CLOSE_TIME/1000);
-    if (var == "AUTO_CLOSE") return SETTING_AUTOMATIC_CLOSE ? "checked" : "";
-    if (var == "AUTO_CLOSE_DELAY") return String(SETTING_AUTOMATIC_CLOSE_TIME/60000);
-    if (var == "WARNING_DELAY") return String(SETTING_AUTOMATIC_CLOSE_WARNING_TIME/1000);
-    if (var == "LOGS") return readLog();
-    if (var == "RELAY_STATE") return (digitalRead(relayPin)? "HIGH": "LOW");
-    if (var == "READ_AUF_STATE") return(digitalRead(readKontaktAuf)? "HIGH": "LOW");
-    if (var == "READ_ZU_STATE") return (digitalRead(readKontaktZu)? "HIGH": "LOW");
-    if (var == "PIEZO_STATE") return (digitalRead(piezoPin)? "HIGH": "LOW");
-    if (var == "TRIGGER_STATE") return (digitalRead(triggerPin)? "HIGH": "LOW");
-    if (var == "PIN1") return (SETTING_KONTAKT_CONFIG? "checked": "");
-    if (var == "PIN2") return (SETTING_KONTAKT_CONFIG? "": "checked");
-    if (var == "AKTUELLER_ZUSTAND") return String(zustand);
-    if (var == "AUTO_CLOSE_CLOCK") return SETTING_CLOSE_ON_TIME ? "checked" : "";
-    if (var == "CURRENT_TIME")
-    {
-      char timeBuffer[6];
-      snprintf(timeBuffer, sizeof(timeBuffer), "%02d:%02d", SETTING_CLOSE_HOUR, SETTING_CLOSE_MINUTE);
-      return String(timeBuffer);
-    }
+void handleLoginPage() {
+    String html = R"rawliteral(
+      <html>
+      <head><title>Login</title></head>
+      <body>
+          <h1>Bitte einloggen</h1>
+          <form action="/login" method="POST">
+              <label>Benutzername:</label><br>
+              <input type="text" name="username"><br>
+              <label>Passwort:</label><br>
+              <input type="password" name="password"><br><br>
+              <input type="submit" value="Login">
+          </form>
+      </body>
+      </html>
+    )rawliteral";
+    httpServer.send(200, "text/html", html);
+}
 
-    return String();
+void handleLogin() {
+    if (httpServer.hasArg("username") && httpServer.hasArg("password")) {
+        String Susername = httpServer.arg("username");
+        String Spassword = httpServer.arg("password");
+        
+        if (Susername == username && (Spassword == passwordLogin || Spassword == passwordAdmin)) {
+            isAuthenticated = true;
+            if (Spassword == passwordAdmin) isAdmin = true;
+            lastLoginTime = millis();
+            httpServer.sendHeader("Location", "/");
+            httpServer.send(302, "text/plain", "");
+            return;
+        }
+    }
+    httpServer.send(403, "text/html", "Login fehlgeschlagen! <a href='/login'>Zur&uuml;ck</a>");
+}
+
+void handleRoot() {
+  if (!isAuthenticated) {
+      httpServer.sendHeader("Location", "/login");
+      httpServer.send(302, "text/plain", "");
+      return;
+  }
+  if (!isAdmin) httpServer.send(200, "text/html", preprocessor(htmlPage));
+  else httpServer.send(200, "text/html", preprocessor(htmlAdminPage));
+}
+
+void handleSetState() {
+  if (httpServer.hasArg("newState")) {
+      zustand = httpServer.arg("newState").toInt();
+  }
+  httpServer.sendHeader("Location", "/");
+  httpServer.send(302, "text/plain", "");
+}
+
+void handleHttpToggle() {
+  toggle(11);
+  httpServer.sendHeader("Location", "/");
+  httpServer.send(302, "text/plain", "");
+}
+
+void handleOpen()
+{
+  if (zustand == GESCHLOSSEN || zustand == HALT_ZU || zustand == UNBEKANNTER_ZUSTAND) {
+      toggle(11);
+  }
+  openSinceTime=millis(); //resetet den Timer zur Automatischen Torschließung.
+  httpServer.sendHeader("Location", "/");
+  httpServer.send(302, "text/plain", "");
+}
+
+void handleClose()
+{
+  if (zustand == GEOEFFNET || zustand == HALT_AUF || zustand == UNBEKANNTER_ZUSTAND)
+  {
+    toggle(11);
+  }
+}
+
+void handleOpenTime()
+{
+  if(zustand==GESCHLOSSEN || zustand == HALT_ZU || zustand == UNBEKANNTER_ZUSTAND)
+  {
+    openSinceTime=millis(); //resetet den Timer zur Automatischen Torschließung.
+    unsigned long temp = httpServer.arg("openTime").toInt()*1000*60;
+    toggle(11, temp);
+  } 
+  httpServer.sendHeader("Location", "/");
+  httpServer.send(302, "text/plain", "");
+}
+
+void handleSettings()
+{
+  if (httpServer.hasArg("autoStop"))
+  {
+    if(SETTING_STOP_STUCK != true)logNachricht(4);
+    SETTING_STOP_STUCK = true;
+  }
+  else SETTING_STOP_STUCK = false;
+  
+  if (httpServer.hasArg("maxOpenTime"))
+  {
+    if(httpServer.arg("maxOpenTime").toInt()*1000 != SETTING_MAX_OPEN_TIME)logNachricht(5);
+    SETTING_MAX_OPEN_TIME = httpServer.arg("maxOpenTime").toInt()*1000;
+  }
+  if (httpServer.hasArg("maxCloseTime"))
+  {
+    if(httpServer.arg("maxCloseTime").toInt()*1000 != SETTING_MAX_CLOSE_TIME)logNachricht(6);
+    SETTING_MAX_CLOSE_TIME = httpServer.arg("maxCloseTime").toInt()*1000;
+  }
+  if (httpServer.hasArg("autoClose"))
+  {
+    if(SETTING_AUTOMATIC_CLOSE != true)logNachricht(7);
+    SETTING_AUTOMATIC_CLOSE = true;
+  }
+  else SETTING_AUTOMATIC_CLOSE = false;
+  
+  if (httpServer.hasArg("autoCloseDelay"))
+  {
+    if(httpServer.arg("autoCloseDelay").toInt()*1000*60 != SETTING_AUTOMATIC_CLOSE_TIME)logNachricht(8);
+    SETTING_AUTOMATIC_CLOSE_TIME = httpServer.arg("autoCloseDelay").toInt()*1000*60;
+  }
+  if (httpServer.hasArg("warningDelay"))
+  {
+    if(httpServer.arg("warningDelay").toInt()*1000 != SETTING_AUTOMATIC_CLOSE_WARNING_TIME)logNachricht(9);
+    SETTING_AUTOMATIC_CLOSE_WARNING_TIME = httpServer.arg("warningDelay").toInt()*1000;
+  }
+  if (httpServer.hasArg("AutoCloseEnabled"))
+  {
+    if(SETTING_CLOSE_ON_TIME != true)logNachricht(16);
+    SETTING_CLOSE_ON_TIME = true;
+  }
+  else SETTING_CLOSE_ON_TIME = false;
+
+  preferences.begin("GaragenESP", false);
+  preferences.putBool("S1", SETTING_STOP_STUCK);
+  preferences.putBool("S2", SETTING_AUTOMATIC_CLOSE);
+  preferences.putInt("S3", SETTING_MAX_OPEN_TIME);
+  preferences.putInt("S4", SETTING_MAX_CLOSE_TIME);
+  preferences.putInt("S5", SETTING_AUTOMATIC_CLOSE_TIME);
+  preferences.putInt("S6", SETTING_AUTOMATIC_CLOSE_WARNING_TIME);
+  preferences.putBool("S8", SETTING_CLOSE_ON_TIME);
+  preferences.end();
+
+  httpServer.sendHeader("Location", "/");
+  httpServer.send(302, "text/plain", "");
+}
+
+void handleSetAutoCloseTime()
+{
+  if (httpServer.hasArg("time")) {
+  String timeString = httpServer.arg("time"); // Format: hh:mm
+  int separatorIndex = timeString.indexOf(':');
+  if (separatorIndex != -1) {
+    SETTING_CLOSE_HOUR = timeString.substring(0, separatorIndex).toInt(); // Stunden extrahieren
+    SETTING_CLOSE_MINUTE = timeString.substring(separatorIndex + 1).toInt(); // Minuten extrahieren
+
+    Serial.println(SETTING_CLOSE_HOUR);
+    Serial.println(SETTING_CLOSE_MINUTE);
+    
+    // Uhrzeit speichern (z. B. in Preferences)
+    preferences.begin("GaragenESP", false);
+    preferences.putInt("S9", SETTING_CLOSE_HOUR);
+    preferences.putInt("S10", SETTING_CLOSE_MINUTE);
+    preferences.end();
+    logNachricht(17);
+    logNachricht(18);
+  }
+}
+
+httpServer.sendHeader("Location", "/");
+httpServer.send(302, "text/plain", "");
+}
+
+void handleReadConfig()
+{
+  if (httpServer.hasArg("zuContact")) {
+    String selectedPin = httpServer.arg("zuContact");
+    if (selectedPin == "1")
+    {
+      SETTING_KONTAKT_CONFIG = true;
+    }
+    else if (selectedPin == "2")
+    {
+      SETTING_KONTAKT_CONFIG = false;
+    }
+    preferences.begin("GaragenESP", false);
+    preferences.putBool("S7", SETTING_KONTAKT_CONFIG);
+    preferences.end();
+
+    readKontaktAuf = (!SETTING_KONTAKT_CONFIG)? defaultReadKontaktAuf:defaultReadKontaktZu;
+    readKontaktZu = (!SETTING_KONTAKT_CONFIG)? defaultReadKontaktZu:defaultReadKontaktAuf;
+  }
+
+  httpServer.sendHeader("Location", "/");
+  httpServer.send(302, "text/plain", "");
 }
