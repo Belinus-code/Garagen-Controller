@@ -66,7 +66,7 @@ Warning: This software is designed to controll a garage door, which trigger line
 | `/close`       | POST   | Closes the door if open | false |
 | `/openTime`    | POST   | Opens the door for a set duration | false |
 | `/settings`    | POST   | Updates configuration values | false |
-| `/read_config` | POST   | Reads and updates stored settings | true |
+| `/read_config` | POST   | Updates Pin configuration of Magnet-Sensors | true |
 
 ### Authentication
 
