@@ -16,7 +16,6 @@ This project implements a smart garage door control system using an ESP32. It pr
 - **Over-the-Air (OTA) Updates:** Update firmware without physical access.
 - **Logging & Configuration:** Settings are stored in the ESP32's NVS (Non-Volatile Storage).
 - **Automatic DDNS Update:** Automatically updates DNS Entry to allow access with a domain.
-- 
 
 ## Hardware Requirements
 
