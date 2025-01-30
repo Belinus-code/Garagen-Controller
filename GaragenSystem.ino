@@ -10,6 +10,7 @@
 #include <ArduinoJson.h>
 
 #include "website.h"
+#include "secrets.h"
 
 // ----- Zustandsdefinierungen -----
 
